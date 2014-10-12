@@ -1,0 +1,10 @@
+.cproject
+.project
+.settings/
+blocks.dat
+console.log
+Debug/
+Release/
+prof.txt
+gmon.out
+*.exe
