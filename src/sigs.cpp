@@ -48,8 +48,10 @@ void Verifier::verifyBatch(const vector<Sigcpp> &sigcpps) {
 	}
 	// Everything must check
 	int *rets = secp256k1_ecdsa_verify_batch(sigs.size(), &*sigs.begin());
-	for (int i = 0; i < sigcpps.size(); i++)
-		assert(rets[i] == 1);
+	for (int i = 0; i < sigcpps.size(); i++) {
+		if (!rets[i])
+			cout << "Failed #" << i << endl; // #5 should fail
+	}
 
 	free(rets);
 }
@@ -62,7 +64,7 @@ string readString(char *&p) {
 	return s;
 }
 
-int main2() {
+int main() {
 	secp256k1_start();
 	ifstream sigs("/tmp/sigs2.dat", ios_base::in|ios_base::binary|ios::ate);
 	auto size = sigs.tellg();
@@ -79,7 +81,10 @@ int main2() {
 			string hash = readString(p);
 			string signature = readString(p);
 			string key = readString(p);
+			if (i == 5)
+				hash.at(0) = 4;
 			Sigcpp sig { hash, signature, key };
+
 			toVerify.push_back(sig);
 			i++;
 			if (i == 10)

@@ -280,14 +280,24 @@ int secp256k1_ecdsa_privkey_import(unsigned char *seckey, const unsigned char *p
 
 typedef struct {
 	secp256k1_gej_t a;
-	secp256k1_num_t na;
-	secp256k1_num_t ng;
+	// secp256k1_num_t na;
+	// secp256k1_num_t ng;
+	int wnaf_na[257];
+	int bits_na;
+	int wnaf_ng_1[129];
+	int bits_ng_1;
+	int wnaf_ng_128[129];
+	int bits_ng_128;
 	secp256k1_num_t r;
 } ecmult_params_t;
+
+static inline int max(int a, int b) { return a > b ? a : b; }
 
 int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
 	int *prets = malloc(sigsLen * sizeof(int));
     int ret = -3;
+
+    int work_item_size = sizeof(ecmult_params_t);
 
     const secp256k1_ge_consts_t *c = secp256k1_ge_consts;
     ecmult_params_t *ecmult_params = malloc(sigsLen * sizeof(ecmult_params_t));
@@ -325,13 +335,31 @@ int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
 
 	    // w = 1/s
 	    // u1 = zw, u2 = rw
-
+	    // u1.G + u2.Q -> na = u2, ng = u1
 	    secp256k1_gej_t pubkeyj; secp256k1_gej_set_ge(&pubkeyj, &q);
 
 	    memcpy(&pParams->a, &pubkeyj, sizeof(secp256k1_gej_t));
-	    memcpy(&pParams->na, &u2, sizeof(secp256k1_num_t));
-	    memcpy(&pParams->ng, &u1, sizeof(secp256k1_num_t));
+	    // memcpy(&pParams->na, &u2, sizeof(secp256k1_num_t));
+	    // memcpy(&pParams->ng, &u1, sizeof(secp256k1_num_t));
 	    memcpy(&pParams->r, &s.r, sizeof(secp256k1_num_t));
+
+	    int wnaf_na[257];
+	    pParams->bits_na = secp256k1_ecmult_wnaf(wnaf_na, &u2, WINDOW_A);
+	    memcpy(pParams->wnaf_na, wnaf_na, sizeof(wnaf_na));
+
+	    // Splitted G factors.
+	    secp256k1_num_t ng_1, ng_128;
+	    secp256k1_num_init(&ng_1);
+	    secp256k1_num_init(&ng_128);
+
+	    // split ng into ng_1 and ng_128 (where gn = gn_1 + gn_128*2^128, and gn_1 and gn_128 are ~128 bit)
+	    secp256k1_num_split(&ng_1, &ng_128, &u1, 128);
+
+	    // Build wnaf representation for ng_1 and ng_128
+	    int wnaf_ng_1[129];   pParams->bits_ng_1   = secp256k1_ecmult_wnaf(wnaf_ng_1,   &ng_1,   WINDOW_G);
+	    int wnaf_ng_128[129]; pParams->bits_ng_128 = secp256k1_ecmult_wnaf(wnaf_ng_128, &ng_128, WINDOW_G);
+	    memcpy(pParams->wnaf_ng_1, wnaf_ng_1, sizeof(wnaf_ng_1));
+	    memcpy(pParams->wnaf_ng_128, wnaf_ng_128, sizeof(wnaf_ng_128));
 
 	    end:
 	    pParams++;
@@ -342,9 +370,38 @@ int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
     secp256k1_gej_t *pr = pr0;
 
     // Perform EC multiplication and sum
+    const secp256k1_ecmult_consts_t *mc = secp256k1_ecmult_consts;
     pParams = ecmult_params;
     for (int i = 0; i < sigsLen; i++) {
-    	secp256k1_ecmult(pr, &pParams->a, &pParams->na, &pParams->ng); // u1.G + u2.Q
+    	// secp256k1_ecmult(pr, &pParams->a, &pParams->na, &pParams->ng);
+
+        secp256k1_gej_t pre_a[ECMULT_TABLE_SIZE(WINDOW_A)];
+        secp256k1_ecmult_table_precomp_gej(pre_a, &pParams->a, WINDOW_A);
+
+        secp256k1_gej_set_infinity(pr);
+        secp256k1_gej_t tmpj;
+        secp256k1_ge_t tmpa;
+
+        int bits = max(pParams->bits_na, pParams->bits_ng_1);
+        bits = max(bits, pParams->bits_ng_128);
+        for (int i=bits-1; i>=0; i--) {
+            secp256k1_gej_double(pr, pr);
+            int n;
+            if (i < pParams->bits_na && (n = pParams->wnaf_na[i])) {
+                ECMULT_TABLE_GET_GEJ(&tmpj, pre_a, n, WINDOW_A);
+                secp256k1_gej_add(pr, pr, &tmpj);
+            }
+
+            if (i < pParams->bits_ng_1 && (n = pParams->wnaf_ng_1[i])) {
+                ECMULT_TABLE_GET_GE(&tmpa, mc->pre_g, n, WINDOW_G);
+                secp256k1_gej_add_ge(pr, pr, &tmpa);
+            }
+            if (i < pParams->bits_ng_128 && (n = pParams->wnaf_ng_128[i])) {
+                ECMULT_TABLE_GET_GE(&tmpa, mc->pre_g_128, n, WINDOW_G);
+                secp256k1_gej_add_ge(pr, pr, &tmpa);
+            }
+        }
+
     	pParams++;
     	pr++;
     }
