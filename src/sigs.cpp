@@ -14,6 +14,7 @@
 #include <boost/make_unique.hpp>
 #include <secp256k1.h>
 #include <windows.h>
+#include <CL/cl.h>
 
 #include "sigs.h"
 
@@ -29,7 +30,13 @@ typedef struct {
 } Sigcpp;
 
 class Verifier {
+private:
+	cl_context context;
+	cl_command_queue command_queue;
+	cl_program program;
 public:
+	Verifier(cl_context context, cl_command_queue command_queue, cl_program program) :
+		context(context), command_queue(command_queue), program(program) {}
 	bool verify(const Sig &sig);
 	void verifyBatch(const vector<Sigcpp> &sigs);
 };
@@ -46,8 +53,12 @@ void Verifier::verifyBatch(const vector<Sigcpp> &sigcpps) {
 	for (auto &s : sigcpps) {
 		sigs.push_back(Sig { s.hash.size(), (byte*)s.hash.data(), s.signature.size(), (byte*)s.signature.data(), s.pubkey.size(), (byte*)s.pubkey.data() });
 	}
-	// Everything must check
-	int *rets = secp256k1_ecdsa_verify_batch(sigs.size(), &*sigs.begin());
+
+	cl_int ret;
+    cl_kernel precomp_kernel = clCreateKernel(program, "secp256k1_ecmult_table_precomp_gej", &ret);
+    cl_kernel mult_kernel = clCreateKernel(program, "secp256k1_ecmult", &ret);
+	// Everything must check ...
+	int *rets = secp256k1_ecdsa_verify_batch(context, command_queue, precomp_kernel, mult_kernel, sigs.size(), &*sigs.begin());
 	for (int i = 0; i < sigcpps.size(); i++) {
 		if (!rets[i])
 			cout << "Failed #" << i << endl; // #5 should fail
@@ -66,7 +77,52 @@ string readString(char *&p) {
 
 int main() {
 	secp256k1_start();
-	ifstream sigs("/tmp/sigs2.dat", ios_base::in|ios_base::binary|ios::ate);
+
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+
+    // Get platform and device information
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_DEFAULT, 1,
+            &device_id, &ret_num_devices);
+
+    // Create an OpenCL context
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+
+    // Create a command queue
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+
+    cl_program program;
+    {
+		ifstream source("secp256k1.cl", ios_base::in|ios_base::binary|ios::ate);
+		size_t size = source.tellg();
+		auto source_str = boost::make_unique<char []>(size);
+		const char *sources[] = { source_str.get() };
+		const size_t lens[] = { size };
+		source.seekg(0, ios::beg);
+		source.read(source_str.get(), size);
+
+	    program = clCreateProgramWithSource(context, 1,
+	    		sources, lens, &ret);
+
+	    // Build the program
+	    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+	    cout << ret << endl;
+
+	    size_t len;
+		char *buffer;
+		clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, 0, NULL, &len);
+		buffer = (char *)malloc(len);
+		clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, len, buffer, NULL);
+		cout << buffer << endl;
+    }
+
+	ifstream sigs("/tmp/sigs.dat", ios_base::in|ios_base::binary|ios::ate);
 	auto size = sigs.tellg();
 	vector<Sigcpp> toVerify;
 	{
@@ -87,17 +143,13 @@ int main() {
 
 			toVerify.push_back(sig);
 			i++;
-			if (i == 10)
+			if (i == 262144)
 				break;
 		}
 	}
 	cout << toVerify.size() << endl;
 
-	Verifier v;
-
-	LARGE_INTEGER q1, q2, ticksPerSecond;
-	QueryPerformanceFrequency(&ticksPerSecond);
-	QueryPerformanceCounter(&q1);
+	Verifier v(context, command_queue, program);
 
 	v.verifyBatch(toVerify);
 
@@ -111,8 +163,8 @@ int main() {
 	}
 #endif
 
-	QueryPerformanceCounter(&q2);
-	auto elapsed = (q2.QuadPart - q1.QuadPart) / ticksPerSecond.QuadPart;
-	cout << elapsed << endl; // 190s for 2142967 sigs => 0.08ms / sig
+	// CPU: cout << elapsed << endl; // 190s for 2142967 sigs => 0.08ms / sig
+
+
 	return 0;
 }

@@ -23,7 +23,7 @@ typedef struct {
 	const unsigned char *pubkey;
 } Sig;
 
-int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs);
+int *secp256k1_ecdsa_verify_batch(cl_context context, cl_command_queue command_queue, cl_kernel ecmult_table_precomp_gej_kernel, cl_kernel ecmult_kernel, int sigsLen, const Sig *sigs);
 
 #if defined (__cplusplus)
 }

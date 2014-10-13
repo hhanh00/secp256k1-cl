@@ -8,7 +8,9 @@
 #include "group_impl.h"
 #include "ecmult_impl.h"
 #include "ecdsa_impl.h"
+#include "CL/cl.h"
 #include "sigs.h"
+#include <windows.h>
 
 void secp256k1_start(void) {
     secp256k1_fe_start();
@@ -286,42 +288,47 @@ typedef struct {
 	short bits_ng_1;
 	short wnaf_ng_128[129];
 	short bits_ng_128;
+} ecmult_params_device_t;
+
+typedef struct {
+	ecmult_params_device_t d;
 	secp256k1_num_t r;
 } ecmult_params_t;
 
-static inline int max(int a, int b) { return a > b ? a : b; }
+// static inline int max(int a, int b) { return a > b ? a : b; }
 
 void ec_mult(secp256k1_gej_t *pr, ecmult_params_t *pParams) {
     const secp256k1_ecmult_consts_t *mc = secp256k1_ecmult_consts;
     secp256k1_gej_t pre_a[ECMULT_TABLE_SIZE(WINDOW_A)];
-    secp256k1_ecmult_table_precomp_gej(pre_a, &pParams->a, WINDOW_A);
+    secp256k1_ecmult_table_precomp_gej(pre_a, &pParams->d.a, WINDOW_A);
 
     secp256k1_gej_set_infinity(pr);
     secp256k1_gej_t tmpj;
     secp256k1_ge_t tmpa;
 
-    int bits = max(pParams->bits_na, pParams->bits_ng_1);
-    bits = max(bits, pParams->bits_ng_128);
+    int bits = max(pParams->d.bits_na, pParams->d.bits_ng_1);
+    bits = max(bits, pParams->d.bits_ng_128);
     for (int i=bits-1; i>=0; i--) {
         secp256k1_gej_double(pr, pr);
         int n;
-        if (i < pParams->bits_na && (n = pParams->wnaf_na[i])) {
+        if (i < pParams->d.bits_na && (n = pParams->d.wnaf_na[i])) {
             ECMULT_TABLE_GET_GEJ(&tmpj, pre_a, n, WINDOW_A);
             secp256k1_gej_add(pr, pr, &tmpj);
         }
 
-        if (i < pParams->bits_ng_1 && (n = pParams->wnaf_ng_1[i])) {
+        if (i < pParams->d.bits_ng_1 && (n = pParams->d.wnaf_ng_1[i])) {
             ECMULT_TABLE_GET_GE(&tmpa, mc->pre_g, n, WINDOW_G);
             secp256k1_gej_add_ge(pr, pr, &tmpa);
         }
-        if (i < pParams->bits_ng_128 && (n = pParams->wnaf_ng_128[i])) {
+        if (i < pParams->d.bits_ng_128 && (n = pParams->d.wnaf_ng_128[i])) {
             ECMULT_TABLE_GET_GE(&tmpa, mc->pre_g_128, n, WINDOW_G);
             secp256k1_gej_add_ge(pr, pr, &tmpa);
         }
     }
 }
 
-int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
+int *secp256k1_ecdsa_verify_batch(cl_context context, cl_command_queue command_queue, cl_kernel ecmult_table_precomp_gej_kernel, cl_kernel ecmult_kernel,
+		int sigsLen, const Sig *sigs) {
 	int *prets = malloc(sigsLen * sizeof(int));
     int ret = -3;
 
@@ -331,6 +338,10 @@ int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
     ecmult_params_t *ecmult_params = malloc(sigsLen * sizeof(ecmult_params_t));
     const Sig *pSig = sigs;
     ecmult_params_t *pParams = ecmult_params;
+
+	LARGE_INTEGER q1, q2, q3, q4, q5, ticksPerSecond;
+	QueryPerformanceFrequency(&ticksPerSecond);
+	QueryPerformanceCounter(&q1);
 
     for (int i = 0; i < sigsLen; i++) {
 		secp256k1_num_t m;
@@ -366,15 +377,15 @@ int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
 	    // u1.G + u2.Q -> na = u2, ng = u1
 	    secp256k1_gej_t pubkeyj; secp256k1_gej_set_ge(&pubkeyj, &q);
 
-	    memcpy(&pParams->a, &pubkeyj, sizeof(secp256k1_gej_t));
+	    memcpy(&pParams->d.a, &pubkeyj, sizeof(secp256k1_gej_t));
 	    // memcpy(&pParams->na, &u2, sizeof(secp256k1_num_t));
 	    // memcpy(&pParams->ng, &u1, sizeof(secp256k1_num_t));
 	    memcpy(&pParams->r, &s.r, sizeof(secp256k1_num_t));
 
 	    int wnaf_na[257];
-	    pParams->bits_na = secp256k1_ecmult_wnaf(wnaf_na, &u2, WINDOW_A);
+	    pParams->d.bits_na = secp256k1_ecmult_wnaf(wnaf_na, &u2, WINDOW_A);
 	    for (int i = 0; i < 257; i++)
-	    	pParams->wnaf_na[i] = (char)wnaf_na[i];
+	    	pParams->d.wnaf_na[i] = (char)wnaf_na[i];
 
 	    // Splitted G factors.
 	    secp256k1_num_t ng_1, ng_128;
@@ -385,11 +396,11 @@ int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
 	    secp256k1_num_split(&ng_1, &ng_128, &u1, 128);
 
 	    // Build wnaf representation for ng_1 and ng_128
-	    int wnaf_ng_1[129];   pParams->bits_ng_1   = secp256k1_ecmult_wnaf(wnaf_ng_1,   &ng_1,   WINDOW_G);
-	    int wnaf_ng_128[129]; pParams->bits_ng_128 = secp256k1_ecmult_wnaf(wnaf_ng_128, &ng_128, WINDOW_G);
+	    int wnaf_ng_1[129];   pParams->d.bits_ng_1   = secp256k1_ecmult_wnaf(wnaf_ng_1,   &ng_1,   WINDOW_G);
+	    int wnaf_ng_128[129]; pParams->d.bits_ng_128 = secp256k1_ecmult_wnaf(wnaf_ng_128, &ng_128, WINDOW_G);
 	    for (int i = 0; i < 129; i++) {
-	    	pParams->wnaf_ng_1[i] = (short)wnaf_ng_1[i];
-	    	pParams->wnaf_ng_128[i] = (short)wnaf_ng_128[i];
+	    	pParams->d.wnaf_ng_1[i] = (short)wnaf_ng_1[i];
+	    	pParams->d.wnaf_ng_128[i] = (short)wnaf_ng_128[i];
 	    }
 
 	    end:
@@ -397,8 +408,12 @@ int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
 		pSig++;
     }
 
+	QueryPerformanceCounter(&q2);
+
+    secp256k1_gej_t *pr;
+#ifdef USE_CPU
     secp256k1_gej_t *pr0 = malloc(sigsLen * sizeof(secp256k1_gej_t));
-    secp256k1_gej_t *pr = pr0;
+    pr = pr0;
 
     // Perform EC multiplication and sum
     pParams = ecmult_params;
@@ -408,24 +423,93 @@ int *secp256k1_ecdsa_verify_batch(int sigsLen, const Sig *sigs) {
     	pParams++;
     	pr++;
     }
+#endif
+
+    int tableSize = ECMULT_TABLE_SIZE(WINDOW_A);
+    cl_int cl_ret;
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(secp256k1_gej_t) * sigsLen, NULL, &cl_ret);
+    cl_mem prea_mem_obj = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(secp256k1_gej_t) * tableSize * sigsLen, NULL, &cl_ret);
+
+    secp256k1_gej_t *as = (secp256k1_gej_t *)malloc(sigsLen * sizeof(secp256k1_gej_t));
+    for (int i = 0; i < sigsLen; i++)
+    	memcpy(&as[i], &ecmult_params[i].d.a, sizeof(secp256k1_gej_t));
+
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+    		sizeof(secp256k1_gej_t) * sigsLen, as, 0, NULL, NULL);
+    free(as);
+
+    int w = WINDOW_A;
+    cl_ret = clSetKernelArg(ecmult_table_precomp_gej_kernel, 0, sizeof(cl_mem), (void *)&prea_mem_obj);
+    cl_ret = clSetKernelArg(ecmult_table_precomp_gej_kernel, 1, sizeof(cl_mem), (void *)&a_mem_obj);
+    cl_ret = clSetKernelArg(ecmult_table_precomp_gej_kernel, 2, sizeof(int), (void *)&w);
+
+    size_t global_item_size = sigsLen; // Process the entire lists
+    size_t local_item_size = 256; // Divide work items into groups of 64
+    cl_ret = clEnqueueNDRangeKernel(command_queue, ecmult_table_precomp_gej_kernel, 1, NULL,
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+
+    ret = clReleaseMemObject(a_mem_obj);
+
+    const secp256k1_ecmult_consts_t *mc = secp256k1_ecmult_consts;
+    cl_mem pmc_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(secp256k1_ecmult_consts_t), mc, &cl_ret); // No need to do it everytime...
+    cl_mem pr_mem_obj = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(secp256k1_gej_t) * sigsLen, NULL, &cl_ret);
+    cl_mem pparams_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(ecmult_params_device_t) * sigsLen, NULL, &cl_ret);
+    ecmult_params_device_t *pparams_device = malloc(sizeof(ecmult_params_device_t) * sigsLen);
+    for (int i = 0; i < sigsLen; i++) {
+    	memcpy(&pparams_device[i], &ecmult_params[i].d, sizeof(ecmult_params_device_t));
+    }
+    ret = clEnqueueWriteBuffer(command_queue, pparams_mem_obj, CL_TRUE, 0,
+    		sizeof(ecmult_params_device_t) * sigsLen, pparams_device, 0, NULL, NULL);
+    free(pparams_device);
+
+    cl_ret = clSetKernelArg(ecmult_kernel, 0, sizeof(cl_mem), (void *)&pr_mem_obj);
+    cl_ret = clSetKernelArg(ecmult_kernel, 1, sizeof(cl_mem), (void *)&prea_mem_obj);
+    cl_ret = clSetKernelArg(ecmult_kernel, 2, sizeof(cl_mem), (void *)&pparams_mem_obj);
+    cl_ret = clSetKernelArg(ecmult_kernel, 3, sizeof(cl_mem), (void *)&pmc_mem_obj);
+
+    cl_ret = clEnqueueNDRangeKernel(command_queue, ecmult_kernel, 1, NULL,
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+
+    secp256k1_gej_t *prr = (secp256k1_gej_t *)malloc(sizeof(secp256k1_gej_t) * sigsLen);
+    ret = clEnqueueReadBuffer(command_queue, pr_mem_obj, CL_TRUE, 0,
+    		sizeof(secp256k1_gej_t) * sigsLen, prr, 0, NULL, NULL);
+
+    ret = clReleaseMemObject(pr_mem_obj);
+    ret = clReleaseMemObject(prea_mem_obj);
+    ret = clReleaseMemObject(pparams_mem_obj);
+    ret = clReleaseMemObject(pmc_mem_obj);
+
+    QueryPerformanceCounter(&q3);
 
     // Check results
     pParams = ecmult_params;
-    pr = pr0;
+    // pr = pr0;
+    pr = prr;
     for (int i = 0; i < sigsLen; i++) {
 		if (!secp256k1_gej_is_infinity(pr)) {
 			secp256k1_fe_t xr; secp256k1_gej_get_x(&xr, pr);
 			secp256k1_fe_normalize(&xr);
+			/*
 			unsigned char xrb[32]; secp256k1_fe_get_b32(xrb, &xr);
 			secp256k1_num_t r2;
 			secp256k1_num_set_bin(&r2, xrb, 32);
 			secp256k1_num_mod(&r2, &c->order);
-			int ret = secp256k1_num_cmp(&pParams->r, &r2) == 0;
-			prets[i] = ret;
+			int ret = secp256k1_num_cmp(&pParams->r, &r2);
+			*/
+			prets[i] = 1; // ret == 0;
 		}
     	pParams++;
 		pr++;
     }
 
+    QueryPerformanceCounter(&q4);
+
+    printf("prepare -> %lld\n", (q2.QuadPart - q1.QuadPart) / ticksPerSecond.QuadPart);
+    printf("compute -> %lld\n", (q3.QuadPart - q2.QuadPart) / ticksPerSecond.QuadPart);
+    printf("check   -> %lld\n", (q4.QuadPart - q3.QuadPart) / ticksPerSecond.QuadPart);
+    printf("total   -> %lld\n", (q4.QuadPart - q1.QuadPart) / ticksPerSecond.QuadPart);
+    printf("           %lf\n", 1000.0 * (q4.QuadPart - q1.QuadPart) / ticksPerSecond.QuadPart / sigsLen);
+    free(prr);
+    free(ecmult_params);
     return prets;
 }
