@@ -408,6 +408,9 @@ int *secp256k1_ecdsa_verify_batch(cl_context context, cl_command_queue command_q
 		pSig++;
     }
 
+    cl_int cl_ret;
+    const secp256k1_ecmult_consts_t *mc = secp256k1_ecmult_consts;
+    cl_mem pmc_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(secp256k1_ecmult_consts_t), mc, &cl_ret); // No need to do it everytime...
 	QueryPerformanceCounter(&q2);
 
     secp256k1_gej_t *pr;
@@ -426,7 +429,6 @@ int *secp256k1_ecdsa_verify_batch(cl_context context, cl_command_queue command_q
 #endif
 
     int tableSize = ECMULT_TABLE_SIZE(WINDOW_A);
-    cl_int cl_ret;
     cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(secp256k1_gej_t) * sigsLen, NULL, &cl_ret);
     cl_mem prea_mem_obj = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(secp256k1_gej_t) * tableSize * sigsLen, NULL, &cl_ret);
 
@@ -450,9 +452,7 @@ int *secp256k1_ecdsa_verify_batch(cl_context context, cl_command_queue command_q
 
     ret = clReleaseMemObject(a_mem_obj);
 
-    const secp256k1_ecmult_consts_t *mc = secp256k1_ecmult_consts;
-    cl_mem pmc_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(secp256k1_ecmult_consts_t), mc, &cl_ret); // No need to do it everytime...
-    cl_mem pr_mem_obj = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(secp256k1_gej_t) * sigsLen, NULL, &cl_ret);
+    cl_mem pr_mem_obj = clCreateBuffer(context, CL_MEM_READ_WRITE, 32 * sigsLen, NULL, &cl_ret);
     cl_mem pparams_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(ecmult_params_device_t) * sigsLen, NULL, &cl_ret);
     ecmult_params_device_t *pparams_device = malloc(sizeof(ecmult_params_device_t) * sigsLen);
     for (int i = 0; i < sigsLen; i++) {
@@ -470,9 +470,9 @@ int *secp256k1_ecdsa_verify_batch(cl_context context, cl_command_queue command_q
     cl_ret = clEnqueueNDRangeKernel(command_queue, ecmult_kernel, 1, NULL,
             &global_item_size, &local_item_size, 0, NULL, NULL);
 
-    secp256k1_gej_t *prr = (secp256k1_gej_t *)malloc(sizeof(secp256k1_gej_t) * sigsLen);
+    byte *prr = (byte *)malloc(32 * sigsLen);
     ret = clEnqueueReadBuffer(command_queue, pr_mem_obj, CL_TRUE, 0,
-    		sizeof(secp256k1_gej_t) * sigsLen, prr, 0, NULL, NULL);
+    		32 * sigsLen, prr, 0, NULL, NULL);
 
     ret = clReleaseMemObject(pr_mem_obj);
     ret = clReleaseMemObject(prea_mem_obj);
@@ -484,31 +484,25 @@ int *secp256k1_ecdsa_verify_batch(cl_context context, cl_command_queue command_q
     // Check results
     pParams = ecmult_params;
     // pr = pr0;
-    pr = prr;
-    for (int i = 0; i < sigsLen; i++) {
-		if (!secp256k1_gej_is_infinity(pr)) {
-			secp256k1_fe_t xr; secp256k1_gej_get_x(&xr, pr);
-			secp256k1_fe_normalize(&xr);
-			/*
-			unsigned char xrb[32]; secp256k1_fe_get_b32(xrb, &xr);
-			secp256k1_num_t r2;
-			secp256k1_num_set_bin(&r2, xrb, 32);
-			secp256k1_num_mod(&r2, &c->order);
-			int ret = secp256k1_num_cmp(&pParams->r, &r2);
-			*/
-			prets[i] = 1; // ret == 0;
-		}
-    	pParams++;
-		pr++;
+    for (int i = 0; i < sigsLen; i++) { // TODO: Point at infinity
+		unsigned char *pxrb = &prr[32 * i];
+		secp256k1_num_t r2;
+		secp256k1_num_set_bin(&r2, pxrb, 32);
+		secp256k1_num_mod(&r2, &c->order);
+		int ret = secp256k1_num_cmp(&pParams->r, &r2);
+		prets[i] = ret == 0;
+
+		pParams++;
     }
 
     QueryPerformanceCounter(&q4);
+    unsigned long long tickerPerMs = ticksPerSecond.QuadPart / 1000;
 
-    printf("prepare -> %lld\n", (q2.QuadPart - q1.QuadPart) / ticksPerSecond.QuadPart);
-    printf("compute -> %lld\n", (q3.QuadPart - q2.QuadPart) / ticksPerSecond.QuadPart);
-    printf("check   -> %lld\n", (q4.QuadPart - q3.QuadPart) / ticksPerSecond.QuadPart);
-    printf("total   -> %lld\n", (q4.QuadPart - q1.QuadPart) / ticksPerSecond.QuadPart);
-    printf("           %lf\n", 1000.0 * (q4.QuadPart - q1.QuadPart) / ticksPerSecond.QuadPart / sigsLen);
+    printf("prepare -> %lld\n", (q2.QuadPart - q1.QuadPart) / tickerPerMs);
+    printf("compute -> %lld\n", (q3.QuadPart - q2.QuadPart) / tickerPerMs);
+    printf("check   -> %lld\n", (q4.QuadPart - q3.QuadPart) / tickerPerMs);
+    printf("total   -> %lld\n", (q4.QuadPart - q1.QuadPart) / tickerPerMs);
+    printf("           %lf\n", (double)(q4.QuadPart - q1.QuadPart) / tickerPerMs / sigsLen);
     free(prr);
     free(ecmult_params);
     return prets;

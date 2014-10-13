@@ -61,6 +61,9 @@ typedef struct {
     secp256k1_ge_t fin; // -(sum(prec[j][0], j=0..63))
 } secp256k1_ecmult_consts_t;
 
+typedef struct {
+    unsigned char v[32];
+} b32_t;
     
 void secp256k1_gej_set_infinity(secp256k1_gej_t *r) {
     r->infinity = 1;
@@ -74,6 +77,17 @@ void secp256k1_gej_double(secp256k1_gej_t *r, secp256k1_gej_t *a);
 void secp256k1_gej_add(__global secp256k1_gej_t *r, const secp256k1_gej_t *a, __global const secp256k1_gej_t *b);
 void secp256k1_gej_add_local(secp256k1_gej_t *pr, const secp256k1_gej_t *pa, const secp256k1_gej_t *pb);
 void secp256k1_gej_add_ge(secp256k1_gej_t *r, const secp256k1_gej_t *a, const secp256k1_ge_t *b);
+
+void secp256k1_fe_normalize(secp256k1_fe_t *r);    
+void secp256k1_fe_mul(secp256k1_fe_t *r, const secp256k1_fe_t *a, const secp256k1_fe_t *b);
+void secp256k1_fe_mul_int(secp256k1_fe_t *r, int a);
+void secp256k1_fe_add(secp256k1_fe_t *r, const secp256k1_fe_t *a);
+void secp256k1_fe_sqr(secp256k1_fe_t *r, const secp256k1_fe_t *a);
+void secp256k1_fe_negate(secp256k1_fe_t *r, const secp256k1_fe_t *a, int m);
+int secp256k1_fe_is_zero(const secp256k1_fe_t *a);
+void secp256k1_fe_get_b32(unsigned char *r, const secp256k1_fe_t *a);
+void secp256k1_gej_get_x(secp256k1_fe_t *r, const secp256k1_gej_t *a);
+void secp256k1_fe_inv_var(secp256k1_fe_t *r, const secp256k1_fe_t *a);
 
 __kernel void secp256k1_ecmult_table_precomp_gej(__global secp256k1_gej_t *pre, __global secp256k1_gej_t *pa, int w) {
     int ind = get_global_id(0);
@@ -92,12 +106,13 @@ __kernel void test_ecmult_table_precomp_gej(__global secp256k1_gej_t *pre, __glo
     // pre[ind].infinity = 2;
 }
 
-__kernel void secp256k1_ecmult(__global secp256k1_gej_t *pr, __global secp256k1_gej_t *ppre_a, __global ecmult_params_device_t *pParams, __constant const secp256k1_ecmult_consts_t *mc) {
+__kernel void secp256k1_ecmult(__global b32_t *pr, __global secp256k1_gej_t *ppre_a, __global ecmult_params_device_t *pParams, __constant const secp256k1_ecmult_consts_t *mc) {
     int ind = get_global_id(0);
     int sz = (1 << (WINDOW_A-2));
 
     ecmult_params_device_t params = pParams[ind];
     __global secp256k1_gej_t *pre_a = &ppre_a[ind * sz];
+    __global b32_t *ppr = &pr[ind];
     
     secp256k1_gej_t r;
     secp256k1_gej_set_infinity(&r);
@@ -123,18 +138,14 @@ __kernel void secp256k1_ecmult(__global secp256k1_gej_t *pr, __global secp256k1_
             secp256k1_gej_add_ge(&r, &r, &tmpa);
         }
     }
-    
-    pr[ind] = r;
+
+	secp256k1_fe_t xr; secp256k1_gej_get_x(&xr, &r);
+	secp256k1_fe_normalize(&xr);
+    b32_t b32;
+	secp256k1_fe_get_b32(b32.v, &xr);
+    *ppr = b32;
 }
                       
-void secp256k1_fe_normalize(secp256k1_fe_t *r);    
-void secp256k1_fe_mul(secp256k1_fe_t *r, const secp256k1_fe_t *a, const secp256k1_fe_t *b);
-void secp256k1_fe_mul_int(secp256k1_fe_t *r, int a);
-void secp256k1_fe_add(secp256k1_fe_t *r, const secp256k1_fe_t *a);
-void secp256k1_fe_sqr(secp256k1_fe_t *r, const secp256k1_fe_t *a);
-void secp256k1_fe_negate(secp256k1_fe_t *r, const secp256k1_fe_t *a, int m);
-int secp256k1_fe_is_zero(const secp256k1_fe_t *a);
-
 void secp256k1_gej_neg(secp256k1_gej_t *r, __global const secp256k1_gej_t *a) {
     r->infinity = a->infinity;
     r->x = a->x;
@@ -284,7 +295,7 @@ void secp256k1_fe_set_b32(secp256k1_fe_t *r, const unsigned char *a) {
 }
 
 /** Convert a field element to a 32-byte big endian value. Requires the input to be normalized */
-void static secp256k1_fe_get_b32(unsigned char *r, const secp256k1_fe_t *a) {
+void secp256k1_fe_get_b32(unsigned char *r, const secp256k1_fe_t *a) {
 #ifdef VERIFY
     assert(a->normalized);
 #endif
@@ -754,3 +765,76 @@ void secp256k1_gej_add_ge(secp256k1_gej_t *r, const secp256k1_gej_t *a, const se
     secp256k1_fe_mul(&h3, &h3, &s1); secp256k1_fe_negate(&h3, &h3, 1);
     secp256k1_fe_add(&r->y, &h3);
 }
+
+void secp256k1_gej_get_x(secp256k1_fe_t *r, const secp256k1_gej_t *a) {
+    secp256k1_fe_t zi2; secp256k1_fe_inv_var(&zi2, &a->z); secp256k1_fe_sqr(&zi2, &zi2);
+    secp256k1_fe_mul(r, &a->x, &zi2);
+}
+
+void secp256k1_fe_inv(secp256k1_fe_t *r, const secp256k1_fe_t *a) {
+
+    // The binary representation of (p - 2) has 5 blocks of 1s, with lengths in
+    // { 1, 2, 22, 223 }. Use an addition chain to calculate 2^n - 1 for each block:
+    // [1], [2], 3, 6, 9, 11, [22], 44, 88, 176, 220, [223]
+
+    secp256k1_fe_t x2;
+    secp256k1_fe_sqr(&x2, a);
+    secp256k1_fe_mul(&x2, &x2, a);
+
+    secp256k1_fe_t x3;
+    secp256k1_fe_sqr(&x3, &x2);
+    secp256k1_fe_mul(&x3, &x3, a);
+
+    secp256k1_fe_t x6 = x3;
+    for (int j=0; j<3; j++) secp256k1_fe_sqr(&x6, &x6);
+    secp256k1_fe_mul(&x6, &x6, &x3);
+
+    secp256k1_fe_t x9 = x6;
+    for (int j=0; j<3; j++) secp256k1_fe_sqr(&x9, &x9);
+    secp256k1_fe_mul(&x9, &x9, &x3);
+
+    secp256k1_fe_t x11 = x9;
+    for (int j=0; j<2; j++) secp256k1_fe_sqr(&x11, &x11);
+    secp256k1_fe_mul(&x11, &x11, &x2);
+
+    secp256k1_fe_t x22 = x11;
+    for (int j=0; j<11; j++) secp256k1_fe_sqr(&x22, &x22);
+    secp256k1_fe_mul(&x22, &x22, &x11);
+
+    secp256k1_fe_t x44 = x22;
+    for (int j=0; j<22; j++) secp256k1_fe_sqr(&x44, &x44);
+    secp256k1_fe_mul(&x44, &x44, &x22);
+
+    secp256k1_fe_t x88 = x44;
+    for (int j=0; j<44; j++) secp256k1_fe_sqr(&x88, &x88);
+    secp256k1_fe_mul(&x88, &x88, &x44);
+
+    secp256k1_fe_t x176 = x88;
+    for (int j=0; j<88; j++) secp256k1_fe_sqr(&x176, &x176);
+    secp256k1_fe_mul(&x176, &x176, &x88);
+
+    secp256k1_fe_t x220 = x176;
+    for (int j=0; j<44; j++) secp256k1_fe_sqr(&x220, &x220);
+    secp256k1_fe_mul(&x220, &x220, &x44);
+
+    secp256k1_fe_t x223 = x220;
+    for (int j=0; j<3; j++) secp256k1_fe_sqr(&x223, &x223);
+    secp256k1_fe_mul(&x223, &x223, &x3);
+
+    // The final result is then assembled using a sliding window over the blocks.
+
+    secp256k1_fe_t t1 = x223;
+    for (int j=0; j<23; j++) secp256k1_fe_sqr(&t1, &t1);
+    secp256k1_fe_mul(&t1, &t1, &x22);
+    for (int j=0; j<5; j++) secp256k1_fe_sqr(&t1, &t1);
+    secp256k1_fe_mul(&t1, &t1, a);
+    for (int j=0; j<3; j++) secp256k1_fe_sqr(&t1, &t1);
+    secp256k1_fe_mul(&t1, &t1, &x2);
+    for (int j=0; j<2; j++) secp256k1_fe_sqr(&t1, &t1);
+    secp256k1_fe_mul(r, &t1, a);
+}
+
+void secp256k1_fe_inv_var(secp256k1_fe_t *r, const secp256k1_fe_t *a) {
+    secp256k1_fe_inv(r, a);
+}
+

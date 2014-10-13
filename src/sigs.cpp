@@ -37,6 +37,13 @@ private:
 public:
 	Verifier(cl_context context, cl_command_queue command_queue, cl_program program) :
 		context(context), command_queue(command_queue), program(program) {}
+	~Verifier() {
+		cl_int ret;
+	    ret = clReleaseProgram(program);
+	    ret = clReleaseCommandQueue(command_queue);
+	    ret = clReleaseContext(context);
+
+	}
 	bool verify(const Sig &sig);
 	void verifyBatch(const vector<Sigcpp> &sigs);
 };
@@ -64,6 +71,8 @@ void Verifier::verifyBatch(const vector<Sigcpp> &sigcpps) {
 			cout << "Failed #" << i << endl; // #5 should fail
 	}
 
+    ret = clReleaseKernel(precomp_kernel);
+    ret = clReleaseKernel(mult_kernel);
 	free(rets);
 }
 
@@ -124,6 +133,7 @@ int main() {
 
 	ifstream sigs("/tmp/sigs.dat", ios_base::in|ios_base::binary|ios::ate);
 	auto size = sigs.tellg();
+	{
 	vector<Sigcpp> toVerify;
 	{
 		auto memblock = boost::make_unique<char []>(size);
@@ -149,10 +159,10 @@ int main() {
 	}
 	cout << toVerify.size() << endl;
 
+	{
 	Verifier v(context, command_queue, program);
 
 	v.verifyBatch(toVerify);
-
 #if 0
 	int i = 0;
 	for (auto &s : toVerify) {
@@ -162,9 +172,13 @@ int main() {
 		i++;
 	}
 #endif
-
+	}
 	// CPU: cout << elapsed << endl; // 190s for 2142967 sigs => 0.08ms / sig
+	}
+	secp256k1_stop();
 
+	string s;
+	getline(cin, s);
 
 	return 0;
 }
